@@ -370,7 +370,7 @@ read_progress_and_log() {
         fi
         spin_i=$(((spin_i + 1) % 4))
         spinner_char=$(echo "$spinner" | cut -c $((spin_i + 1)))
-        printf "\r[%s] %s: %s%% | Speed: %sx | ETA: %s | Frame: %s" "$spinner_char" "$ENCODER_LABEL" "$last_percentage" "$current_speed" "$etr_str" "$current_frame"
+        printf "\r%s %s%% Speed: %sx" "$ENCODER_LABEL" "$last_percentage" "$current_speed"
     done
     
     # Clean up the file descriptor
@@ -395,30 +395,34 @@ check_remote_host() {
 }
 
 run_remote_igpu() {
-    log "--- Starting Remote iGPU Transcode (QSV) ---"
+    log "--- Starting Remote iGPU Transcode (QSV Universal) ---"
     disk_space_warn
-    
+
     if [ "${DEBUG_MODE:-false}" = "true" ]; then
         network_diagnostics "$SSH_HOST" "$SSH_PORT"
     fi
-    
+
     local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_igpu_stderr.log"
-    local FFMPEG_CMD_REMOTE=""
-    if [ "$GPU_ENCODE_MODE" = "cqp" ]; then
-        log_debug "Using CQP (ICQ) mode for iGPU with quality level ${GPU_CQ_LEVEL}"
-        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -progress pipe:2 -protocol_whitelist file,pipe,fd -i - -map 0:v:0? -map 0:a:0? -c:v h264_qsv -preset:v ${QSV_PRESET} -profile:v high -level:v 4.1 -pix_fmt yuv420p -global_quality ${GPU_CQ_LEVEL} -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 -"
+    local MAX_WIDTH=$(echo "$RESOLUTION_MAX" | cut -d'x' -f1)
+    local VF_STRING=""
+
+    if [ "${VIDEO_WIDTH:-0}" -gt "$MAX_WIDTH" ]; then
+        log_debug "Video width ($VIDEO_WIDTH) exceeds max ($MAX_WIDTH). Applying software scaling."
+        VF_STRING="-vf scale=w=${MAX_WIDTH}:h=-2:flags=lanczos"
     else
-        log_debug "Using Bitrate mode for iGPU with target ${BITRATE_TARGET}"
-        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -progress pipe:2 -protocol_whitelist file,pipe,fd -i - -map 0:v:0? -map 0:a:0? -c:v h264_qsv -preset:v ${QSV_PRESET} -profile:v high -level:v 4.0 -pix_fmt yuv420p -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 -"
+        log_debug "Video width ($VIDEO_WIDTH) is within limits. No scaling needed."
+        VF_STRING=""
     fi
-    debug_log "FFMPEG_CMD_REMOTE: '$FFMPEG_CMD_REMOTE'"
+    
+    local FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -y -progress pipe:2 -analyzeduration 100M -probesize 50M -i - -map 0:v:0? -map 0:a:0? ${VF_STRING} -c:v h264_qsv -preset:v ${QSV_PRESET} -profile:v high -level:v 4.1 -pix_fmt yuv420p -tag:v avc1 ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 -"
+    debug_log "FFMPEG_CMD_REMOTE (iGPU): '$FFMPEG_CMD_REMOTE'"
     
     ssh -T -o "ConnectTimeout=15" -o "StrictHostKeyChecking=no" -o "SendEnv=LC_*" -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "TCPKeepAlive=yes" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
         "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> "$FFMPEG_STDERR_LOG" &
     local SSH_PID=$!
     debug_log "SSH_STARTED: PID $SSH_PID for iGPU transcode"
 
-    read_progress_and_log "Remote iGPU" "$SSH_PID" "$FFMPEG_STDERR_LOG"
+    read_progress_and_log "Transcoding iGPU" "$SSH_PID" "$FFMPEG_STDERR_LOG"
     
     wait "$SSH_PID"
     local SSH_EC=$?
@@ -433,30 +437,34 @@ run_remote_igpu() {
 }
 
 run_remote_dgpu() {
-    log "--- Starting Remote dGPU Transcode (NVENC) ---"
+    log "--- Starting Remote dGPU Transcode (NVENC Universal) ---"
     disk_space_warn
 
     if [ "${DEBUG_MODE:-false}" = "true" ]; then
         network_diagnostics "$SSH_HOST" "$SSH_PORT"
     fi
-    
+
     local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_dgpu_stderr.log"
-    local FFMPEG_CMD_REMOTE=""
-    if [ "$GPU_ENCODE_MODE" = "cqp" ]; then
-        log_debug "Using CQP mode for dGPU with quality level ${GPU_CQ_LEVEL}"
-        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -progress pipe:2 -protocol_whitelist file,pipe,fd -i - -map 0:v:0? -map 0:a:0? -c:v h264_nvenc -preset:v ${NVENC_PRESET} -profile:v high -level:v 4.1 -pix_fmt yuv420p -rc:v constqp -qp ${GPU_CQ_LEVEL} -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 -"
+    local MAX_WIDTH=$(echo "$RESOLUTION_MAX" | cut -d'x' -f1)
+    local VF_STRING=""
+
+    if [ "${VIDEO_WIDTH:-0}" -gt "$MAX_WIDTH" ]; then
+        log_debug "Video width ($VIDEO_WIDTH) exceeds max ($MAX_WIDTH). Applying software scaling."
+        VF_STRING="-vf scale=w=${MAX_WIDTH}:h=-2:flags=lanczos"
     else
-        log_debug "Using Bitrate (VBR) mode for dGPU with target ${BITRATE_TARGET}"
-        FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -loglevel error -y -progress pipe:2 -protocol_whitelist file,pipe,fd -i - -map 0:v:0? -map 0:a:0? -c:v h264_nvenc -preset:v ${NVENC_PRESET} -profile:v high -level:v 4.0 -pix_fmt yuv420p -vf \"scale=w=min(iw\\,${RESOLUTION_MAX%x*}):h=min(ih\\,${RESOLUTION_MAX#*x*}):force_original_aspect_ratio=decrease\" -rc:v vbr_hq -b:v ${BITRATE_TARGET} -maxrate:v ${BITRATE_MAX} -bufsize:v ${BITRATE_BUFSIZE} ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 -"
+        log_debug "Video width ($VIDEO_WIDTH) is within limits. No scaling needed."
+        VF_STRING=""
     fi
-    debug_log "FFMPEG_CMD_REMOTE: '$FFMPEG_CMD_REMOTE'"
+
+    local FFMPEG_CMD_REMOTE="ffmpeg -hide_banner -y -progress pipe:2 -analyzeduration 100M -probesize 50M -i - -map 0:v:0? -map 0:a:0? ${VF_STRING} -c:v h264_nvenc -preset:v ${NVENC_PRESET} -profile:v high -level:v 4.1 -pix_fmt yuv420p -tag:v avc1 ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 -"
+    debug_log "FFMPEG_CMD_REMOTE (dGPU): '$FFMPEG_CMD_REMOTE'"
 
     ssh -T -o "ConnectTimeout=15" -o "StrictHostKeyChecking=no" -o "SendEnv=LC_*" -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "TCPKeepAlive=yes" -p "$SSH_PORT" -i "$SSH_KEY" "$SSH_USER@$SSH_HOST" \
         "$FFMPEG_CMD_REMOTE" < "$VIDEO_FILE" > "$TEMP_OUTPUT_FILE" 2> "$FFMPEG_STDERR_LOG" &
     local SSH_PID=$!
     debug_log "SSH_STARTED: PID $SSH_PID for dGPU transcode"
 
-    read_progress_and_log "Remote dGPU" "$SSH_PID" "$FFMPEG_STDERR_LOG"
+    read_progress_and_log "Transcoding dGPU" "$SSH_PID" "$FFMPEG_STDERR_LOG"
 
     wait "$SSH_PID"
     local SSH_EC=$?
@@ -471,20 +479,20 @@ run_remote_dgpu() {
 }
 
 run_local_cpu() {
-    log "--- Starting Local CPU Transcode (libx264) ---"
+    log "--- Starting Local CPU Transcode (libx264 Universal) ---"
     disk_space_warn
     
     local FFMPEG_STDERR_LOG="${LOG_FILE_BASE}_cpu_stderr.log"
-    local SCALE_FILTER="scale=w='min(iw,${RESOLUTION_MAX%x*})':h='min(ih,${RESOLUTION_MAX#*x})':force_original_aspect_ratio=decrease"
+    local SCALE_FILTER="scale=w='min(iw,${RESOLUTION_MAX%x*})':h='min(ih,${RESOLUTION_MAX#*x*})':force_original_aspect_ratio=decrease"
     
-    local LOCAL_FFMPEG_CMD="ffmpeg -hide_banner -loglevel error -y -progress pipe:2 -i \"$VIDEO_FILE\" -map 0:v:0? -map 0:a:0? -c:v libx264 -preset slow -crf 23 -pix_fmt yuv420p -vf \"$SCALE_FILTER\" ${AUDIO_PARAMS} -movflags frag_keyframe+empty_moov -f mp4 \"$TEMP_OUTPUT_FILE\""
+    # Universal command for CPU, with CRF 20 for quality and faststart for streaming.
+    local LOCAL_FFMPEG_CMD="ffmpeg -hide_banner -loglevel error -y -progress pipe:2 -i \"$VIDEO_FILE\" -map 0:v:0? -map 0:a:0? -c:v libx264 -preset slow -crf 20 -profile:v high -level:v 4.1 -pix_fmt yuv420p -tag:v avc1 -vf \"$SCALE_FILTER\" ${AUDIO_PARAMS} -movflags +faststart -f mp4 \"$TEMP_OUTPUT_FILE\""
     debug_log "LOCAL_FFMPEG_CMD: $LOCAL_FFMPEG_CMD"
     
-    # Execute ffmpeg in the background, redirecting stderr to a log file
     bash -c "$LOCAL_FFMPEG_CMD" 2> "$FFMPEG_STDERR_LOG" &
     local FFMPEG_PID=$!
     
-    read_progress_and_log "Local CPU" "$FFMPEG_PID" "$FFMPEG_STDERR_LOG"
+    read_progress_and_log "Transcoding CPU" "$FFMPEG_PID" "$FFMPEG_STDERR_LOG"
     
     wait "$FFMPEG_PID"
     local FFMPEG_EC=$?
@@ -658,6 +666,9 @@ debug_log "FILE_PERMS: $(stat -c %A "$VIDEO_FILE" 2>/dev/null || echo "unknown")
 debug_log "FILE_OWNER: $(stat -c %U:%G "$VIDEO_FILE" 2>/dev/null || echo "unknown")"
 
 VIDEO_CODEC=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null)
+PROBE_DATA=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null)
+VIDEO_WIDTH=$(echo "$PROBE_DATA" | sed -n '1p')
+VIDEO_HEIGHT=$(echo "$PROBE_DATA" | sed -n '2p')
 AUDIO_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null)
 AUDIO_CHANNELS=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null)
 CONTAINER=$(basename "$VIDEO_FILE" | rev | cut -d . -f 1 | rev)
@@ -671,12 +682,12 @@ if [ "${DEBUG_MODE:-false}" = "true" ]; then
     done
 fi
 
-if [ "$CONTAINER" = "mp4" ] && [ "$VIDEO_CODEC" = "h264" ] && [ "$AUDIO_CODEC" = "aac" ] && [ "$AUDIO_CHANNELS" -le 2 ]; then
-    log "File is already compliant. No transcoding needed."
+if [ "$CONTAINER" = "mp4" ] && [ "$VIDEO_CODEC" = "h264" ] && [[ " aac mp3 " =~ " ${AUDIO_CODEC} " ]] && [ "$AUDIO_CHANNELS" -le 6 ]; then
+    log "File is already compliant with universal playback standards. No transcoding needed."
     NEEDS_TRANSCODE=0
     NEEDS_NOTIFICATION=1
 else
-    log "File requires transcoding."
+    log "File requires transcoding to meet universal playback standards."
     NEEDS_TRANSCODE=1
 fi
 
@@ -685,12 +696,12 @@ if [ "$NEEDS_TRANSCODE" -eq 1 ]; then
     OUTBASE=$(basename "${VIDEO_FILE%.*}")
     FINAL_OUTPUT_FILE="${JOB_DIR}/${OUTBASE}.mp4"
     TEMP_OUTPUT_FILE="${JOB_DIR}/${OUTBASE}.tmp.mp4"
-    if [ "$AUDIO_CODEC" = "aac" ] && [ "$AUDIO_CHANNELS" -le 2 ]; then
-        log "Audio is AAC with 2 or fewer channels. Stream will be copied."
+    if [[ " aac mp3 " =~ " ${AUDIO_CODEC} " ]]; then
+        log "Audio is '${AUDIO_CODEC}', which is a compatible codec. Stream will be copied."
         AUDIO_PARAMS="-c:a copy"
     else
-        log "Audio is '${AUDIO_CODEC}'. It will be transcoded to AAC stereo."
-        AUDIO_PARAMS="-c:a aac -ac 2 -b:a 192k"
+        log "Audio is '${AUDIO_CODEC}'. It will be transcoded to AAC 5.1 (384k)."
+        AUDIO_PARAMS="-c:a aac -ac 6 -b:a 384k"
     fi
     REMOTE_HOST_OK=false
     if echo "$TRANSCODE_PRIORITY" | grep -q "remote"; then
@@ -744,11 +755,13 @@ if [ "$NEEDS_TRANSCODE" -eq 1 ]; then
 fi
 
 # This handles the case where the file was already compliant and didn't need a transcode.
-if [ "${NEEDS_NOTIFICATION:-0}" -eq 1 ]; then
-    send_notification
+if [ "${NEEDS_TRANSCODE:-1}" -eq 0 ]; then
+    log "File is compliant. Finalizing."
+    TRANSCODE_SUCCESS=true
+    NEEDS_NOTIFICATION=1
+    # The trap will handle notification sending and exit.
 fi
 
 # The script should have already exited via the logic above, but as a fallback:
 log "Reached end of script unexpectedly. Exiting."
 exit 0
-
